@@ -1,0 +1,29 @@
+.
+├── api.py
+├── archi.txt
+├── data
+│   ├── Regles_Accises_techniques IT (2).docx
+│   └── Taux_Accise_Alcool_France_2026.pdf
+├── ingest.py
+├── rag_chain.py
+├── requirements.txt
+└── src
+    └── comps
+        ├── ingestion
+        │   └── impl
+        │       └── microservice
+        │           └── ingest_service.py
+        ├── llms
+        │   └── impl
+        │       └── microservice
+        │           └── llm_service.py
+        ├── reranks
+        │   └── impl
+        │       └── microservice
+        │           └── rerank_service.py
+        └── retrievers
+            └── impl
+                └── microservice
+                    └── retriever_service.py
+
+16 directories, 11 files
