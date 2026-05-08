@@ -1,127 +1,153 @@
-
-# Copyright (C) 2024-2026 Intel Corporation
-# SPDX-License-Identifier: Apache-2.0
-
 import os
-import jwt
-
+from contextlib import asynccontextmanager
 from dotenv import load_dotenv
-from fastapi import Depends, HTTPException, Request
-from typing import Optional
+from fastapi import FastAPI, HTTPException, Request, Depends
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import Optional, List
+import pyodbc
+import uuid
+from datetime import datetime
 
-from comps import change_opea_logger_level, get_opea_logger, MegaServiceEndpoint, ServiceType
-from comps.cores.mega.micro_service import opea_microservices, register_microservice
-from comps.cores.proto.docarray import ChatHistory, ChatHistoryName
-from comps.cores.utils.utils import sanitize_env
+load_dotenv()
 
-from utils.opea_chat_history import OPEAChatHistoryConnector
+# ── Config SQL Server ─────────────────────────────────────────────────────────
+SQL_SERVER = os.getenv("SQL_SERVER", "localhost")
+SQL_DATABASE = os.getenv("SQL_DATABASE", "ChatHistory")
+SQL_USERNAME = os.getenv("SQL_USERNAME", "sa")
+SQL_PASSWORD = os.getenv("SQL_PASSWORD", "")
+USVC_PORT = int(os.getenv("CHAT_HISTORY_USVC_PORT", 6020))
 
-USVC_NAME = 'opea_service@chat_history'
+def get_connection():
+    conn_str = (
+        f"DRIVER={{ODBC Driver 17 for SQL Server}};"
+        f"SERVER={SQL_SERVER};"
+        f"DATABASE={SQL_DATABASE};"
+        f"UID={SQL_USERNAME};"
+        f"PWD={SQL_PASSWORD};"
+    )
+    return pyodbc.connect(conn_str)
 
-load_dotenv(os.path.join(os.path.dirname(__file__), "impl/microservice/.env"))
+# ── Modèles ───────────────────────────────────────────────────────────────────
+class ChatMessage(BaseModel):
+    question: str
+    answer: str
 
-logger = get_opea_logger(f"{__file__.split('comps/')[1].split('/', 1)[0]}_microservice")
-change_opea_logger_level(logger, log_level=os.getenv("OPEA_LOGGER_LEVEL", "INFO"))
+class ChatHistory(BaseModel):
+    id: Optional[str] = None
+    history: List[ChatMessage]
 
-opea_connector = OPEAChatHistoryConnector(
-    sanitize_env(os.getenv("CHAT_HISTORY_MONGO_HOST")),
-    sanitize_env(os.getenv("CHAT_HISTORY_MONGO_PORT")),
-)
+class ChatHistoryName(BaseModel):
+    id: str
+    history_name: str
 
-def get_user_id(request: Request) -> str:
-    access_token = request.headers.get('Authorization')
-    if not access_token:
-        raise HTTPException(status_code=401, detail="Authorization header missing.")
-    access_token = access_token.replace('Bearer ', '')
-    token = jwt.decode(access_token, options={"verify_signature": False})
-    user_id = token.get('sub')
-    if not user_id:
-        raise HTTPException(status_code=401, detail="User ID not found in token.")
-    return user_id
-
-
-@register_microservice(
-    name=USVC_NAME,
-    service_type=ServiceType.CHAT_HISTORY,
-    endpoint=f"{MegaServiceEndpoint.CHAT_HISTORY}/save",
-    http_method="POST",
-    host="0.0.0.0",
-    port=int(os.getenv('CHAT_HISTORY_USVC_PORT', default=6012)),
-    startup_methods=[opea_connector.init_async],
-    close_methods=[opea_connector.close]
-)
-async def save_history(document: ChatHistory, user_id: str = Depends(get_user_id)):
+# ── App ───────────────────────────────────────────────────────────────────────
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Créer la table si elle n'existe pas
     try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='ChatHistories' AND xtype='U')
+            CREATE TABLE ChatHistories (
+                id NVARCHAR(50) PRIMARY KEY,
+                user_id NVARCHAR(255) NOT NULL,
+                history_name NVARCHAR(250) NOT NULL,
+                history NVARCHAR(MAX) NOT NULL,
+                created_at DATETIME DEFAULT GETDATE()
+            )
+        """)
+        conn.commit()
+        conn.close()
+        print("✅ SQL Server connecté et table prête")
+    except Exception as e:
+        print(f"⚠️ SQL Server non disponible : {e}")
+    yield
+
+app = FastAPI(
+    title="Chat History Service",
+    description="Service historique avec SQL Server",
+    version="1.0.0",
+    lifespan=lifespan
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ── Endpoints ─────────────────────────────────────────────────────────────────
+@app.get("/v1/health_check")
+def health_check():
+    return {"status": "ok", "service": "chat_history", "db": "SQL Server"}
+
+@app.post("/v1/chat_history/save", response_model=ChatHistoryName)
+async def save_history(document: ChatHistory, request: Request):
+    import json
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        history_json = json.dumps([m.dict() for m in document.history])
+        history_name = document.history[0].question[:30]
+
         if document.id:
-            res = await opea_connector.append_history(document.id, document.history, user_id)
+            cursor.execute(
+                "UPDATE ChatHistories SET history=? WHERE id=?",
+                history_json, document.id
+            )
+            conn.commit()
+            return ChatHistoryName(id=document.id, history_name=history_name)
         else:
-            res = await opea_connector.create_new_history(document.history, user_id)
-        return res
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+            new_id = str(uuid.uuid4())
+            cursor.execute(
+                "INSERT INTO ChatHistories (id, user_id, history_name, history) VALUES (?,?,?,?)",
+                new_id, "default_user", history_name, history_json
+            )
+            conn.commit()
+            return ChatHistoryName(id=new_id, history_name=history_name)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
 
-
-@register_microservice(
-    name=USVC_NAME,
-    service_type=ServiceType.CHAT_HISTORY,
-    endpoint=f"{MegaServiceEndpoint.CHAT_HISTORY}/get",
-    http_method="GET",
-    host="0.0.0.0",
-    port=int(os.getenv('CHAT_HISTORY_USVC_PORT', default=6012)),
-    startup_methods=[opea_connector.init_async],
-    close_methods=[opea_connector.close]
-)
-async def get_history(history_id: Optional[str] = None, user_id: str = Depends(get_user_id)):
+@app.get("/v1/chat_history/get")
+async def get_history(history_id: Optional[str] = None):
+    import json
     try:
-        if history_id is None:
-            return await opea_connector.get_all_histories_for_user(user_id)
-        return await opea_connector.get_history_by_id(history_id, user_id)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        conn = get_connection()
+        cursor = conn.cursor()
+        if history_id:
+            cursor.execute("SELECT * FROM ChatHistories WHERE id=?", history_id)
+            row = cursor.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="History not found")
+            return {"id": row[0], "history": json.loads(row[3]), "history_name": row[2]}
+        else:
+            cursor.execute("SELECT id, history_name FROM ChatHistories")
+            rows = cursor.fetchall()
+            return [{"id": r[0], "history_name": r[1]} for r in rows]
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
 
-
-@register_microservice(
-    name=USVC_NAME,
-    service_type=ServiceType.CHAT_HISTORY,
-    endpoint=f"{MegaServiceEndpoint.CHAT_HISTORY}/delete",
-    http_method="DELETE",
-    host="0.0.0.0",
-    port=int(os.getenv('CHAT_HISTORY_USVC_PORT', default=6012)),
-    startup_methods=[opea_connector.init_async],
-    close_methods=[opea_connector.close]
-)
-async def delete_history(history_id: str, user_id: str = Depends(get_user_id)):
+@app.delete("/v1/chat_history/delete")
+async def delete_history(history_id: str):
     try:
-        await opea_connector.delete_history(history_id, user_id)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM ChatHistories WHERE id=?", history_id)
+        conn.commit()
+        return {"status": "deleted"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-
-@register_microservice(
-    name=USVC_NAME,
-    service_type=ServiceType.CHAT_HISTORY,
-    endpoint=f"{MegaServiceEndpoint.CHAT_HISTORY}/change_name",
-    http_method="POST",
-    host="0.0.0.0",
-    port=int(os.getenv('CHAT_HISTORY_USVC_PORT', default=6012)),
-    startup_methods=[opea_connector.init_async],
-    close_methods=[opea_connector.close]
-)
-async def change_history_name(history_name: ChatHistoryName, user_id: str = Depends(get_user_id)):
-    try:
-        await opea_connector.change_history_name(history_name.id, history_name.history_name, user_id)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
+    finally:
+        conn.close()
 
 if __name__ == "__main__":
-    opea_microservices[USVC_NAME].start()
-    logger.info(f"Started OPEA Microservice: {USVC_NAME}")
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=USVC_PORT)

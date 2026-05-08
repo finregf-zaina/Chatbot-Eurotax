@@ -1,118 +1,76 @@
-
-# Copyright (C) 2024-2026 Intel Corporation
-# SPDX-License-Identifier: Apache-2.0
-
 from typing import List
-from comps import get_opea_logger
-from comps.cores.proto.docarray import ChatMessage, ChatHistoryName
-from comps.cores.utils.mongodb import OPEAMongoConnector
+from motor.motor_asyncio import AsyncIOMotorClient
+from beanie import init_beanie
 from .documents import ChatHistoryDocument
 
-logger = get_opea_logger(f"{__file__.split('comps/')[1].split('/', 1)[0]}_microservice")
+class OPEAChatHistoryConnector:
+    def __init__(self, mongodb_host: str, mongodb_port: str) -> None:
+        self.mongodb_host = mongodb_host
+        self.mongodb_port = mongodb_port
+        self.client = None
 
-def generate_history_title(history: List[ChatMessage]) -> str:
-    return history[0].question[:30] if len(history[0].question) > 30 else history[0].question
+    async def init_async(self):
+        self.client = AsyncIOMotorClient(f"mongodb://{self.mongodb_host}:{self.mongodb_port}")
+        await init_beanie(database=self.client["CHAT_HISTORY"], document_models=[ChatHistoryDocument])
 
-class OPEAChatHistoryConnector(OPEAMongoConnector):
-    def __init__(self, mongodb_host, mongodb_port) -> None:
-        super().__init__(
-            host=mongodb_host,
-            port=mongodb_port,
-            db_name="CHAT_HISTORY",
-            documents=[ChatHistoryDocument],
+    async def close(self):
+        if self.client:
+            self.client.close()
+
+    def _generate_title(self, history) -> str:
+        q = history[0].question
+        return q[:30] if len(q) > 30 else q
+
+    async def create_new_history(self, history, user_id: str):
+        h = ChatHistoryDocument(
+            history=history,
+            user_id=user_id,
+            history_name=self._generate_title(history)
         )
+        await h.insert()
+        return {"id": str(h.id), "history_name": h.history_name}
 
-    async def create_new_history(self, chat_history: List[ChatMessage], user_id: str) -> ChatHistoryName:
-        try:
-            h = ChatHistoryDocument(
-                history=chat_history,
-                user_id=user_id,
-                history_name=f"{generate_history_title(chat_history)}"
-            )
-            id = await self.insert(h)
-        except Exception as e:
-            err_msg = f"Error inserting history: {chat_history[0].question} for user_id: {user_id}: {e}"
-            logger.error(err_msg)
-            raise Exception(err_msg) from e
-        logger.info(f"History inserted: {h}")
-        return ChatHistoryName(id=str(id), history_name=h.history_name)
+    async def append_history(self, history_id: str, history, user_id: str):
+        h = await ChatHistoryDocument.get(history_id)
+        if not h:
+            raise ValueError(f"History {history_id} not found.")
+        if h.user_id != user_id:
+            raise ValueError("User ID mismatch.")
+        h.history.extend(history)
+        await h.save()
+        return {"id": str(h.id), "history_name": h.history_name}
 
-    async def append_history(self, history_id: str, chat_history: List[ChatMessage], user_id: str) -> ChatHistoryName:
-        try:
-            h = await self.get_by_id(ChatHistoryDocument, history_id)
-            if not h:
-                raise ValueError(f"Chat history with id {history_id} not found.")
-            if h.user_id != user_id:
-                raise ValueError(f"User ID {user_id} does not match the history's user ID {h.user_id}.")
-            h.history.extend(chat_history)
-            await h.save()
-        except ValueError as e:
-            err_msg = f"Error updating history with id: {history_id}: {e}"
-            logger.error(err_msg)
-            raise ValueError(err_msg) from e
-        except Exception as e:
-            err_msg = f"Error updating history with id: {history_id}: {e}"
-            logger.error(err_msg)
-            raise Exception(err_msg) from e
-        return ChatHistoryName(id=str(h.id), history_name=h.history_name)
+    async def change_history_name(self, history_id: str, history_name: str, user_id: str):
+        if not history_name or history_name.strip() == "":
+            raise ValueError("History name cannot be empty.")
+        if len(history_name) > 250:
+            raise ValueError("History name too long.")
+        h = await ChatHistoryDocument.get(history_id)
+        if not h:
+            raise ValueError(f"History {history_id} not found.")
+        if h.user_id != user_id:
+            raise ValueError("User ID mismatch.")
+        h.history_name = history_name
+        await h.save()
 
-    async def change_history_name(self, history_id: str, history_name: str, user_id: str) -> None:
-        try:
-            if not history_name or history_name.strip() == "":
-                raise ValueError("History name cannot be empty.")
-            if len(history_name) > 250:
-                raise ValueError("History name cannot be longer than 250 characters.")
-            h = await self.get_by_id(ChatHistoryDocument, history_id)
-            if not h:
-                raise ValueError(f"Chat history with id {history_id} not found.")
-            if h.user_id != user_id:
-                raise ValueError(f"User ID {user_id} does not match the history's user ID {h.user_id}.")
-            h.history_name = history_name
-            await h.save()
-        except ValueError as e:
-            err_msg = f"Error changing history name with id: {history_id}: {e}"
-            logger.error(err_msg)
-            raise ValueError(err_msg) from e
-        except Exception as e:
-            err_msg = f"Error changing history name with id: {history_id}: {e}"
-            logger.error(err_msg)
-            raise Exception(err_msg) from e
+    async def delete_history(self, history_id: str, user_id: str):
+        h = await ChatHistoryDocument.get(history_id)
+        if not h:
+            raise ValueError(f"History {history_id} not found.")
+        if h.user_id != user_id:
+            raise ValueError("User ID mismatch.")
+        await h.delete()
 
-    async def delete_history(self, history_id: str, user_id: str) -> None:
-        try:
-            h = await self.get_by_id(ChatHistoryDocument, history_id)
-            if not h:
-                raise ValueError(f"Chat history with id {history_id} not found.")
-            if h.user_id != user_id:
-                raise ValueError(f"User ID {user_id} does not match the history's user ID {h.user_id}.")
-            await self.delete(ChatHistoryDocument, history_id)
-        except Exception as e:
-            err_name = f"Error deleting history with id: {history_id}: {e}"
-            logger.error(err_name)
-            raise Exception(err_name) from e
+    async def get_all_histories_for_user(self, user_id: str):
+        histories = await ChatHistoryDocument.find(
+            ChatHistoryDocument.user_id == user_id
+        ).to_list()
+        return [{"id": str(h.id), "history_name": h.history_name} for h in histories]
 
-    async def get_all_histories_for_user(self, user_id: str) -> list[ChatHistoryName]:
-        try:
-            histories = await ChatHistoryDocument.find(ChatHistoryDocument.user_id == user_id).to_list()
-            return [ChatHistoryName(id=str(h.id), history_name=h.history_name) for h in histories]
-        except Exception as e:
-            err_name = f"Error retrieving histories for user: {user_id}: {e}"
-            logger.error(err_name)
-            raise Exception(err_name) from e
-
-    async def get_history_by_id(self, history_id: str, user_id: str) -> ChatHistoryDocument:
-        try:
-            h = await self.get_by_id(ChatHistoryDocument, history_id)
-            if not h:
-                raise ValueError(f"Chat history with id {history_id} not found.")
-            if h.user_id != user_id:
-                raise ValueError(f"User ID {user_id} does not match the history's user ID {h.user_id}.")
-        except ValueError as e:
-            err_msg = f"Error retrieving history for user: {user_id} with id: {history_id}: {e}"
-            logger.error(err_msg)
-            raise ValueError(err_msg) from e
-        except Exception as e:
-            err_name = f"Error retrieving history for user: {user_id} with id: {history_id}: {e}"
-            logger.error(err_name)
-            raise Exception(err_name) from e
+    async def get_history_by_id(self, history_id: str, user_id: str):
+        h = await ChatHistoryDocument.get(history_id)
+        if not h:
+            raise ValueError(f"History {history_id} not found.")
+        if h.user_id != user_id:
+            raise ValueError("User ID mismatch.")
         return h

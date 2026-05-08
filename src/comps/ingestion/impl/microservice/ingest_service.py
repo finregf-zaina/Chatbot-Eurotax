@@ -1,47 +1,59 @@
 import os
+import httpx
+from typing import List
 from dotenv import load_dotenv
 from langchain_community.document_loaders import PyPDFLoader, Docx2txtLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_openai import AzureOpenAIEmbeddings
 from langchain_qdrant import QdrantVectorStore
-from qdrant_client import QdrantClient
+from langchain.embeddings.base import Embeddings
 
 load_dotenv()
 
+EMBEDDING_SERVICE_URL = os.getenv("EMBEDDING_SERVICE_URL", "http://localhost:6002")
+
+# ── Embeddings via microservice ───────────────────────────────────────────────
+class RemoteEmbeddings(Embeddings):
+    """Appelle le microservice embeddings par lots pour éviter les timeouts."""
+
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        all_embeddings = []
+        batch_size = 10  # ✅ Par lots de 10
+        
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i:i + batch_size]
+            print(f"   📦 Batch {i//batch_size + 1}/{(len(texts)-1)//batch_size + 1} ({len(batch)} textes)...")
+            response = httpx.post(
+                f"{EMBEDDING_SERVICE_URL}/v1/embed",
+                json={"texts": batch},
+                timeout=120.0  # ✅ 2 minutes par batch
+            )
+            response.raise_for_status()
+            all_embeddings.extend(response.json()["embeddings"])
+        
+        return all_embeddings
+
+    def embed_query(self, text: str) -> List[float]:
+        response = httpx.post(
+            f"{EMBEDDING_SERVICE_URL}/v1/embed",
+            json={"texts": [text]},
+            timeout=120.0
+        )
+        response.raise_for_status()
+        return response.json()["embeddings"][0]
+
 
 def run_ingestion(force_recreate: bool = False):
-    """
-    Charge les documents du dossier /data, les découpe, les vectorise
-    et les indexe dans Qdrant.
-
-    Args:
-        force_recreate: Si True, recrée la collection (écrase l'existant).
-                        Mettre False en prod pour ingestion incrémentale.
-    """
     directory_path = "./data"
     print(f"\n📁 Recherche de documents dans '{directory_path}'...")
 
-    # ✅ Validation des variables d'environnement critiques
-    required_vars = [
-        "AZURE_OPENAI_EMBEDDING_DEPLOYMENT",
-        "OPENAI_API_VERSION",
-        "AZURE_OPENAI_ENDPOINT",
-        "AZURE_OPENAI_API_KEY",
-        "QDRANT_URL"
-    ]
+    # ✅ Validation
+    required_vars = ["QDRANT_URL", "QDRANT_API_KEY"]
     missing = [v for v in required_vars if not os.getenv(v)]
     if missing:
-        raise EnvironmentError(
-            f"❌ Variables .env manquantes : {', '.join(missing)}\n"
-            f"   Vérifie ton fichier .env à la racine du projet."
-        )
+        raise EnvironmentError(f"❌ Variables .env manquantes : {', '.join(missing)}")
 
-    # ---- 1. Chargement des documents ----------------------------------------
-    loaders = {
-        ".pdf": PyPDFLoader,
-        ".docx": Docx2txtLoader,
-    }
-
+    # ---- 1. Chargement -------------------------------------------------------
+    loaders = {".pdf": PyPDFLoader, ".docx": Docx2txtLoader}
     docs = []
     os.makedirs(directory_path, exist_ok=True)
 
@@ -53,66 +65,66 @@ def run_ingestion(force_recreate: bool = False):
             try:
                 loader = loaders[ext](file_path)
                 loaded = loader.load()
-                # ✅ Ajout du nom de fichier dans les métadonnées pour traçabilité
                 for doc in loaded:
                     doc.metadata["source"] = file
                 docs.extend(loaded)
-                print(f"     ✅ {len(loaded)} page(s) chargée(s)")
+                print(f"     ✅ {len(loaded)} page(s)")
             except Exception as e:
-                print(f"     ⚠️  Erreur sur {file} : {e}")
+                print(f"     ⚠️ Erreur : {e}")
 
     if not docs:
-        print("❌ Aucun document PDF ou DOCX trouvé dans /data. Arrêt.")
+        print("❌ Aucun document trouvé.")
         return
 
-    print(f"\n📊 Total : {len(docs)} page(s) chargée(s) depuis {directory_path}")
+    print(f"\n📊 Total : {len(docs)} page(s)")
 
-    # ---- 2. Découpage (Chunking) ---------------------------------------------
-    # chunk_size=800 / overlap=100 : bon équilibre pour docs juridiques/fiscaux
-    # ✅ Séparateurs adaptés aux documents français avec numérotation légale
-    text_splitter = RecursiveCharacterTextSplitter(
+    # ---- 2. Découpage --------------------------------------------------------
+    splitter = RecursiveCharacterTextSplitter(
         chunk_size=800,
         chunk_overlap=100,
         separators=["\n\n", "\n", ".", " ", ""]
     )
-    splits = text_splitter.split_documents(docs)
-    print(f"✂️  Texte découpé en {len(splits)} chunks.")
+    splits = splitter.split_documents(docs)
+    print(f"✂️  {len(splits)} chunks.")
 
-    # ---- 3. Embeddings Azure AI Search --------------------------------------
-    print("\n🔗 Initialisation des Embeddings Azure AI Search...")
-    embeddings = AzureOpenAIEmbeddings(
-        azure_deployment=os.getenv("AZURE_OPENAI_EMBEDDING_DEPLOYMENT"),
-        openai_api_version=os.getenv("OPENAI_API_VERSION"),
-        azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
-        api_key=os.getenv("AZURE_OPENAI_API_KEY")
-    )
+    # ---- 3. Embeddings via microservice --------------------------------------
+    print(f"\n🔗 Connexion au service embeddings : {EMBEDDING_SERVICE_URL}")
+    try:
+        health = httpx.get(f"{EMBEDDING_SERVICE_URL}/health", timeout=10)
+        health.raise_for_status()
+        print("✅ Service embeddings disponible !")
+    except Exception:
+        raise ConnectionError(
+            f"❌ Service embeddings inaccessible sur {EMBEDDING_SERVICE_URL}\n"
+            f"   Lance d'abord : uvicorn src.comps.embeddings.main:app --port 6012"
+        )
 
-    # ---- 4. Ingestion dans Qdrant -------------------------------------------
+    embeddings = RemoteEmbeddings()
+
+    # ---- 4. Ingestion Qdrant -------------------------------------------------
     qdrant_url = os.getenv("QDRANT_URL")
     collection_name = os.getenv("QDRANT_COLLECTION_NAME", "eurotax_docs")
 
-    print(f"📡 Connexion à Qdrant : {qdrant_url}")
-    print(f"   Collection cible  : '{collection_name}'")
-    print(f"   Mode              : {'🔄 Recréation complète' if force_recreate else '➕ Ajout incrémental'}")
+    print(f"\n📡 Connexion Qdrant : {qdrant_url}")
+    print(f"   Collection : '{collection_name}'")
+    print(f"   Mode : {'🔄 Recréation' if force_recreate else '➕ Incrémental'}")
 
     try:
-        vectorstore = QdrantVectorStore.from_documents(
+        QdrantVectorStore.from_documents(
             documents=splits,
             embedding=embeddings,
             url=qdrant_url,
-            api_key=os.getenv("QDRANT_API_KEY"),  # None si Qdrant local
+            api_key=os.getenv("QDRANT_API_KEY"),
             collection_name=collection_name,
             force_recreate=force_recreate
         )
-        print(f"\n✅ SUCCÈS : {len(splits)} chunks indexés dans Qdrant !")
-        print(f"   Collection '{collection_name}' prête pour le chatbot.\n")
-
+        print(f"\n✅ SUCCÈS : {len(splits)} chunks indexés !")
+        print(f"   Collection '{collection_name}' prête.\n")
     except Exception as e:
         print(f"\n❌ Erreur Qdrant : {e}")
         raise
 
 
 if __name__ == "__main__":
-    # ✅ En dev : force_recreate=True pour repartir propre à chaque test
-    # ✅ En prod : force_recreate=False pour ingestion incrémentale
     run_ingestion(force_recreate=True)
+    

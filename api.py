@@ -93,6 +93,38 @@ def chat(request: ChatRequest):
             detail=f"Erreur lors de la génération de la réponse : {str(e)}"
         )
 
+
+  # ── Format compatible avec MonRAG.Gateway (.NET) ──────────────────────────────
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+
+class PipelineRequest(BaseModel):
+    messages: list[ChatMessage]
+    stream: bool = False
+
+@app.post("/api/pipeline/chat", tags=["Pipeline"])
+def pipeline_chat(request: PipelineRequest):
+    """
+    Endpoint appelé par MonRAG.Orchestrator (.NET).
+    Reçoit le format { messages: [...], stream: bool }
+    et le traduit vers ask_eurotax().
+    """
+    # On prend le dernier message de l'utilisateur
+    user_messages = [m for m in request.messages if m.role == "user"]
+    if not user_messages:
+        raise HTTPException(status_code=400, detail="Aucun message utilisateur trouvé.")
+    
+    question = user_messages[-1].content
+    
+    try:
+        answer = ask_eurotax(question)
+        return {"answer": answer, "status": "success"}
+        
+    except Exception as e:
+        print(f"[ERREUR /api/pipeline/chat] {e}")
+        raise HTTPException(status_code=500, detail=str(e))      
+
 # ── Lancement direct ───────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
@@ -102,3 +134,5 @@ if __name__ == "__main__":
         port=8000,
         reload=True   # ✅ Désactiver en prod
     )
+
+
